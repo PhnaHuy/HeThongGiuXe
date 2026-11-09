@@ -1,0 +1,42 @@
+[project]
+name = "parking-vision"
+version = "0.0.0"
+description = "G0: moi truong desktop va thi giac cho he thong quan ly bai giu xe"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "PySide6>=6.8,<7",
+    "SQLAlchemy>=2.0,<2.1",
+    "ultralytics>=8.3,<9",
+    "torch>=2.6,<3",
+    "torchvision>=0.21,<1",
+    "opencv-python>=4.10,<4.13",
+    "numpy>=1.26,<2.3",
+    "lap>=0.5.12,<0.6",
+    "psutil>=5.9,<8",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [".cache", ".runtime", ".venv*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

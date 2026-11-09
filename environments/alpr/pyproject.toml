@@ -1,0 +1,9 @@
+[project]
+name = "parking-alpr-runtime"
+version = "0.0.0"
+description = "Isolated Fast Plate OCR CPU runtime"
+requires-python = ">=3.13,<3.14"
+dependencies = ["fast-plate-ocr[onnx]==1.1.0"]
+
+[tool.uv]
+package = false
