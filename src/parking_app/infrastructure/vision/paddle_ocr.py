@@ -1,13 +1,18 @@
-"""Isolated subprocess adapter for the dedicated PaddleOCR environment."""
+"""Persistent subprocess adapter for the dedicated PaddleOCR environment."""
 
 from __future__ import annotations
 
 import base64
 import json
 import os
+import queue
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TextIO
+
+from parking_app.domain.plate import PlateOCRResult
 
 
 class PlateOCRFailure(RuntimeError):
@@ -24,14 +29,65 @@ class OCRRuntimeOptions(Protocol):
 class PaddleOCRSubprocess:
     def __init__(self, options: OCRRuntimeOptions) -> None:
         self.options = options
+        self._process: subprocess.Popen | None = None
+        self._responses: queue.Queue[str | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._ready = False
 
-    def recognize(self, crops: tuple[bytes, ...]) -> tuple[tuple[str, float], ...]:
-        if not crops:
+    def warmup(self) -> None:
+        with self._lock:
+            self._ensure_ready()
+
+    def recognize(self, images: tuple[bytes, ...]) -> tuple[PlateOCRResult, ...]:
+        if not images:
             return ()
         payload = json.dumps(
-            {"images": [base64.b64encode(crop).decode("ascii") for crop in crops]},
+            {"images": [base64.b64encode(image).decode("ascii") for image in images]},
             separators=(",", ":"),
         )
+        with self._lock:
+            self._ensure_ready()
+            process = self._process
+            if process is None or process.stdin is None:
+                raise PlateOCRFailure("Tiến trình PaddleOCR chưa sẵn sàng.")
+            try:
+                process.stdin.write(payload + "\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                self._stop_process()
+                raise PlateOCRFailure("Mất kết nối với tiến trình PaddleOCR.") from exc
+
+            marker, content = self._read_message()
+            if marker == "PARKING_OCR_ERROR:":
+                try:
+                    message = json.loads(content)["error"]
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    message = "Tiến trình PaddleOCR báo lỗi không đúng định dạng."
+                raise PlateOCRFailure(str(message))
+            if marker != "PARKING_OCR_RESULT:":
+                self._stop_process()
+                raise PlateOCRFailure("Tiến trình PaddleOCR không trả kết quả hợp lệ.")
+            try:
+                results = json.loads(content)["results"]
+                return tuple(
+                    PlateOCRResult(
+                        text=str(item["text"]),
+                        confidence=float(item["confidence"]),
+                        plate_image_data=(
+                            base64.b64decode(item["plate_image"], validate=True)
+                            if item.get("plate_image")
+                            else None
+                        ),
+                    )
+                    for item in results
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise PlateOCRFailure("Kết quả trả về từ PaddleOCR không đúng định dạng.") from exc
+
+    def _ensure_ready(self) -> None:
+        if self._ready and self._process is not None and self._process.poll() is None:
+            return
+        self._stop_process()
         environment = os.environ.copy()
         environment.update(
             {
@@ -40,57 +96,98 @@ class PaddleOCRSubprocess:
                 "FLAGS_use_mkldnn": "0",
             }
         )
-        for attribute, variable in (
-            ("ocr_model_path", "PARKING_PLATE_OCR_MODEL"),
-            ("ocr_config_path", "PARKING_PLATE_OCR_CONFIG"),
-        ):
-            path = getattr(self.options, attribute, None)
-            if path is not None:
-                environment[variable] = str(path.resolve())
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [str(self.options.python_path), str(self.options.worker_path)],
-                input=payload,
-                capture_output=True,
-                check=False,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 cwd=self.options.worker_path.parent.parent,
                 env=environment,
                 text=True,
-                timeout=self.options.timeout_s,
+                encoding="utf-8",
+                bufsize=1,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise PlateOCRFailure(
-                f"OCR vượt quá thời gian chờ {self.options.timeout_s:g} giây."
-            ) from exc
         except OSError as exc:
             raise PlateOCRFailure(f"Không khởi chạy được môi trường OCR: {exc}") from exc
-
-        result_line = self._find_response(completed.stdout, "PARKING_OCR_RESULT:")
-        error_line = self._find_response(completed.stdout, "PARKING_OCR_ERROR:")
-        if error_line is not None:
+        if process.stdout is None:
+            process.terminate()
+            raise PlateOCRFailure("Tiến trình PaddleOCR không mở được kênh kết quả.")
+        self._process = process
+        self._responses = queue.Queue()
+        threading.Thread(
+            target=self._read_stdout,
+            args=(process.stdout, self._responses),
+            daemon=True,
+        ).start()
+        marker, content = self._read_message()
+        if marker == "PARKING_OCR_ERROR:":
+            self._stop_process()
             try:
-                message = json.loads(error_line)["error"]
+                message = json.loads(content)["error"]
             except (KeyError, TypeError, json.JSONDecodeError):
-                message = "Tiến trình PaddleOCR báo lỗi không đúng định dạng."
+                message = "Không khởi tạo được PaddleOCR."
             raise PlateOCRFailure(str(message))
-        if completed.returncode != 0:
-            detail = completed.stderr.strip()[-1000:]
-            raise PlateOCRFailure(detail or "Tiến trình PaddleOCR kết thúc với lỗi.")
-        if result_line is None:
-            raise PlateOCRFailure("Tiến trình PaddleOCR không trả kết quả hợp lệ.")
-        try:
-            results = json.loads(result_line)["results"]
-            return tuple((str(item["text"]), float(item["confidence"])) for item in results)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise PlateOCRFailure("Kết quả trả về từ PaddleOCR không đúng định dạng.") from exc
+        if marker != "PARKING_OCR_READY:":
+            self._stop_process()
+            raise PlateOCRFailure("Tiến trình PaddleOCR không hoàn tất khởi tạo.")
+        self._ready = True
 
     @staticmethod
-    def _find_response(output: str, prefix: str) -> str | None:
-        return next(
-            (
-                line.removeprefix(prefix)
-                for line in reversed(output.splitlines())
-                if line.startswith(prefix)
-            ),
-            None,
-        )
+    def _read_stdout(stream: TextIO, responses: queue.Queue[str | None]) -> None:
+        try:
+            for line in stream:
+                responses.put(line.rstrip("\r\n"))
+        finally:
+            responses.put(None)
+
+    def _read_message(self) -> tuple[str | None, str]:
+        deadline = time.monotonic() + self.options.timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._stop_process()
+                raise PlateOCRFailure(
+                    f"OCR vượt quá thời gian chờ {self.options.timeout_s:g} giây."
+                )
+            try:
+                line = self._responses.get(timeout=remaining)
+            except queue.Empty as exc:
+                self._stop_process()
+                raise PlateOCRFailure(
+                    f"OCR vượt quá thời gian chờ {self.options.timeout_s:g} giây."
+                ) from exc
+            if line is None:
+                process = self._process
+                exit_code = process.poll() if process is not None else None
+                self._stop_process()
+                if exit_code not in (None, 0):
+                    raise PlateOCRFailure(f"Tiến trình PaddleOCR kết thúc với mã {exit_code}.")
+                return None, ""
+            for prefix in ("PARKING_OCR_READY:", "PARKING_OCR_RESULT:", "PARKING_OCR_ERROR:"):
+                if line.startswith(prefix):
+                    return prefix, line.removeprefix(prefix)
+
+    def close(self) -> None:
+        with self._lock:
+            self._stop_process()
+
+    def _stop_process(self) -> None:
+        process, self._process = self._process, None
+        self._ready = False
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)

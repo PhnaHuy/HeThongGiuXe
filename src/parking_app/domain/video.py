@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from parking_app.domain.exceptions import ValidationError
 
 if TYPE_CHECKING:
-    from parking_app.domain.vision import VehicleDetection
+    from parking_app.domain.vision import PlateDetection
 
 
 class SourceKind(StrEnum):
@@ -112,30 +112,12 @@ class ParkingSpace:
 
 
 @dataclass(frozen=True)
-class GateLine:
-    """Normalized A→B; entry crosses negative to positive signed side by default."""
-
-    x1: float = 0.2
-    y1: float = 0.5
-    x2: float = 0.8
-    y2: float = 0.5
-    entry_positive: bool = True
-
-    def validate(self) -> None:
-        if not all(math.isfinite(v) and 0 <= v <= 1 for v in (self.x1, self.y1, self.x2, self.y2)):
-            raise ValidationError("Tọa độ vạch phải nằm trong khoảng 0–1.")
-        if math.hypot(self.x2 - self.x1, self.y2 - self.y1) < 0.02:
-            raise ValidationError("Hai đầu vạch phải cách nhau ít nhất 2% khung hình.")
-
-
-@dataclass(frozen=True)
 class SourceConfig:
     id: str
     name: str
     kind: SourceKind
     endpoint: str = field(repr=False)
     purpose: SourcePurpose = SourcePurpose.ENTRY
-    line: GateLine | None = None
     parking_spaces: tuple[ParkingSpace, ...] = ()
 
     def validate(self) -> None:
@@ -158,8 +140,6 @@ class SourceConfig:
                 valid = False
             if not valid:
                 raise ValidationError("Camera cần chỉ số webcam từ 0 hoặc URL RTSP/HTTP hợp lệ.")
-        if self.line is not None:
-            self.line.validate()
         codes: set[str] = set()
         for space in self.parking_spaces:
             space.validate()
@@ -180,7 +160,7 @@ class Frame:
     observed_at: datetime
     media_time_s: float | None
     image: Any = field(repr=False, compare=False)
-    detections: tuple[VehicleDetection, ...] = ()
+    plate_detections: tuple[PlateDetection, ...] = ()
     parking_space_states: dict[str, ParkingSpaceStatus] = field(default_factory=dict)
 
 
@@ -210,8 +190,6 @@ class VisionOptions:
     confidence_threshold: float = 0.25
     image_size: int = 640
     device: str = "cpu"
-    crossing_deadband: float = 0.015
-    crossing_stable_frames: int = 2
     stale_track_frames: int = 300
 
     def __post_init__(self) -> None:
@@ -221,10 +199,5 @@ class VisionOptions:
             raise ValidationError("Kích thước suy luận YOLO phải nằm trong khoảng 32–4096.")
         if not self.device.strip():
             raise ValidationError("Thiết bị suy luận không được để trống.")
-        if (
-            not math.isfinite(self.crossing_deadband)
-            or not 0 <= self.crossing_deadband < 0.5
-            or self.crossing_stable_frames < 1
-            or self.stale_track_frames < self.crossing_stable_frames
-        ):
-            raise ValidationError("Cấu hình chống rung vạch không hợp lệ.")
+        if self.stale_track_frames < 1:
+            raise ValidationError("Thời gian lưu track phải ít nhất một khung hình.")

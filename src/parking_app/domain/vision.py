@@ -14,21 +14,20 @@ class GateDirection(StrEnum):
 
 
 @dataclass(frozen=True)
-class VehicleDetection:
-    """A tracked vehicle observation with normalized box coordinates."""
+class PlateDetection:
+    """A license-plate region detected in normalized image coordinates."""
 
     x1: float
     y1: float
     x2: float
     y2: float
     confidence: float
-    vehicle_type: VehicleType
-    track_id: int | None
+    track_id: int | None = None
 
 
 @dataclass(frozen=True)
 class EventCandidate:
-    """A detected gate crossing that still requires operator confirmation."""
+    """A plate track on a fixed-purpose gate camera, pending operator review."""
 
     id: str
     source_id: str
@@ -42,4 +41,4 @@ class EventCandidate:
     observed_at: datetime
     media_time_s: float | None
     image_data: bytes
-    vehicle_image_samples: tuple[bytes, ...] = ()
+    source_image_samples: tuple[bytes, ...] = ()

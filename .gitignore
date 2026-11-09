@@ -1,28 +1,50 @@
+# Python environments and generated files
 .venv/
-.venv-ocr/
-.venv-ocr-313/
-.venv-alpr/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local settings and editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.skill/
+
+# Local application data and runtime caches
+/data/
 .runtime/
 .cache/
 reports/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-*.egg-info/
-build/
-dist/
-.env
 *.db
 *.db-shm
 *.db-wal
-*.sqlite*
-models/*.pt
-models/*.onnx
-models/**/*.onnx
-models/*.pdparams
-models/*.pdiparams
-models/*.pdmodel
-sample_data/private/
-KE_HOACH_TRIEN_KHAI.md
-yeu-cau.md
+*.sqlite
+*.sqlite3
+
+# Downloaded or generated model weights
+/models/**/*.pt
+/models/**/*.pth
+/models/**/*.onnx
+/models/**/*.pdparams
+/models/**/*.pdiparams
+/models/**/*.pdmodel
+
+# Build and tooling output
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+target/
+
+# Non-runtime project material
+/docs/
+/tests/
+/Fix.md
+/KE_HOACH_TRIEN_KHAI.md
+/yeu-cau.md
+/scripts/check_environment.py
+/scripts/evaluate_plates.py
+/scripts/plate_ocr_worker.py

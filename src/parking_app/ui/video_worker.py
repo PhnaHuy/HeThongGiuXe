@@ -5,33 +5,33 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 
 import cv2
 from PySide6.QtCore import QThread, Signal
 
-from parking_app.application.gate_crossing import GateCrossingTracker
 from parking_app.application.parking_space_monitor import ParkingSpaceMonitor
 from parking_app.application.video_source import VideoCancelled, VideoError, VideoSource
+from parking_app.config.settings import DEFAULT_PLATE_MODEL_PATH
+from parking_app.domain.enums import VehicleType
 from parking_app.domain.video import (
     Frame,
-    GateLine,
     SourceConfig,
     SourceKind,
+    SourcePurpose,
     StreamStatus,
     VideoOptions,
     VisionOptions,
 )
-from parking_app.domain.vision import EventCandidate, GateDirection, VehicleDetection
-from parking_app.infrastructure.video.isolated_source import IsolatedVideoSource
-from parking_app.infrastructure.vision.yolo_detector import (
-    VehicleDetector,
-    VisionError,
-    YOLOVehicleDetector,
+from parking_app.domain.vision import (
+    EventCandidate,
+    GateDirection,
+    PlateDetection,
 )
+from parking_app.infrastructure.video.isolated_source import IsolatedVideoSource
+from parking_app.infrastructure.vision.errors import VisionError
+from parking_app.infrastructure.vision.plate_detector import PlateTracker, YOLOPlateDetector
 
 
 class VideoWorker(QThread):
@@ -49,8 +49,8 @@ class VideoWorker(QThread):
         realtime: bool = True,
         initial_index: int = 0,
         source_factory: Callable[..., VideoSource] = IsolatedVideoSource,
-        vision_options: VisionOptions | None = None,
-        detector_factory: Callable[[VisionOptions], VehicleDetector] = YOLOVehicleDetector,
+        plate_vision_options: VisionOptions | None = None,
+        plate_detector_factory: Callable[[VisionOptions], PlateTracker] = YOLOPlateDetector,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -59,30 +59,20 @@ class VideoWorker(QThread):
         self.realtime = realtime
         self.initial_index = initial_index
         self.source_factory = source_factory
-        self.vision_options = vision_options or VisionOptions(
-            model_path=Path(__file__).resolve().parents[3] / "models" / "yolov8n.pt"
+        self.plate_vision_options = plate_vision_options or VisionOptions(
+            model_path=DEFAULT_PLATE_MODEL_PATH
         )
-        self.detector_factory = detector_factory
+        self.plate_detector_factory = plate_detector_factory
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._paused = False
         self._seek: int | None = None
         self._frame: Frame | None = None
         self._stream_id = ""
-        self._line = config.line
-        self._line_revision = 0
-        self._applied_line_revision = 0
         self.dropped_frames = 0
         self.frames_read = 0
-        self._detector: VehicleDetector | None = None
-        self._vehicle_samples: dict[int, deque[tuple[int, bytes]]] = defaultdict(
-            lambda: deque(maxlen=5)
-        )
-        self._crossings = GateCrossingTracker(
-            deadband=self.vision_options.crossing_deadband,
-            stable_frames=self.vision_options.crossing_stable_frames,
-            stale_track_frames=self.vision_options.stale_track_frames,
-        )
+        self._plate_detector: PlateTracker | None = None
+        self._candidate_tracks: dict[int, int] = {}
         self._parking_spaces = ParkingSpaceMonitor(config.parking_spaces)
 
     def stop(self) -> None:
@@ -90,24 +80,6 @@ class VideoWorker(QThread):
         with self._condition:
             self._frame = None
             self._condition.notify_all()
-
-    def set_gate_line(self, line: GateLine | None) -> None:
-        """Apply editor changes at a frame boundary on the processing thread."""
-        if line is not None:
-            line.validate()
-        with self._condition:
-            if line != self._line:
-                self._line = line
-                self._line_revision += 1
-
-    def _crossing_events(self, detections, frame_index):
-        with self._condition:
-            line = self._line
-            revision = self._line_revision
-        if revision != self._applied_line_revision:
-            self._crossings.reset()
-            self._applied_line_revision = revision
-        return self._crossings.update(detections, line, frame_index)
 
     def set_paused(self, paused: bool) -> None:
         if self.config.kind == SourceKind.MP4:
@@ -132,13 +104,33 @@ class VideoWorker(QThread):
         with self._condition:
             self._frame = None
             self._stream_id = uuid.uuid4().hex
-        if self._detector is not None:
-            self._detector.reset()
-        self._vehicle_samples.clear()
-        self._crossings.reset()
+        if self._plate_detector is not None:
+            self._plate_detector.reset()
+        self._candidate_tracks.clear()
         self._parking_spaces.reset()
-        # G4/G5 subscribe here to discard tracking/crossing/OCR state.
+        # G4/G5 subscribe here to discard tracking and OCR state.
         self.stream_reset.emit(self._stream_id)
+
+    def _new_candidates(
+        self, detections: tuple[PlateDetection, ...], frame_index: int
+    ) -> list[PlateDetection]:
+        if self.config.purpose == SourcePurpose.PARKING:
+            return []
+        stale_before = frame_index - self.plate_vision_options.stale_track_frames
+        self._candidate_tracks = {
+            track_id: last_seen
+            for track_id, last_seen in self._candidate_tracks.items()
+            if last_seen >= stale_before
+        }
+        new_tracks = []
+        for detection in detections:
+            if detection.track_id is None:
+                continue
+            previous = self._candidate_tracks.get(detection.track_id)
+            self._candidate_tracks[detection.track_id] = frame_index
+            if previous is None:
+                new_tracks.append(detection)
+        return new_tracks
 
     def _publish(self, frame: Frame) -> None:
         with self._condition:
@@ -155,13 +147,13 @@ class VideoWorker(QThread):
     def run(self) -> None:
         is_file = self.config.kind == SourceKind.MP4
         try:
-            self._detector = self.detector_factory(self.vision_options)
+            self._plate_detector = self.plate_detector_factory(self.plate_vision_options)
         except VisionError as exc:
             self.status_changed.emit(StreamStatus.ERROR, str(exc))
             return
         except Exception:
             self.status_changed.emit(
-                StreamStatus.ERROR, "Không thể khởi tạo nhận dạng phương tiện."
+                StreamStatus.ERROR, "Không thể khởi tạo model phát hiện biển số."
             )
             return
         while not self._stop.is_set():
@@ -240,9 +232,10 @@ class VideoWorker(QThread):
             index, media_time, image = result
             observed_at = datetime.now(UTC)
             self.frames_read += 1
-            detections = self._detector.detect(image) if self._detector is not None else ()
-            parking_space_states = self._parking_spaces.update(image.shape, detections)
-            self._remember_vehicle_samples(image, detections, index)
+            plate_detections = (
+                self._plate_detector.track(image) if self._plate_detector is not None else ()
+            )
+            parking_space_states = self._parking_spaces.update(image.shape, plate_detections)
             frame = Frame(
                 source_id=self.config.id,
                 source_kind=self.config.kind,
@@ -251,29 +244,25 @@ class VideoWorker(QThread):
                 observed_at=observed_at,
                 media_time_s=media_time,
                 image=image,
-                detections=detections,
+                plate_detections=plate_detections,
                 parking_space_states=parking_space_states,
             )
-            for detection, direction in self._crossing_events(detections, index):
-                self.event_candidate.emit(self._candidate(frame, detection, direction))
+            for detection in self._new_candidates(plate_detections, index):
+                self.event_candidate.emit(self._candidate(frame, detection))
             self._publish(frame)
             due = time.monotonic() + 1 / source.fps
 
     def _candidate(
         self,
         frame: Frame,
-        detection: VehicleDetection,
-        direction: GateDirection,
+        detection: PlateDetection,
     ) -> EventCandidate:
         if detection.track_id is None:
-            raise VisionError("Sự kiện qua vạch cần track ID hợp lệ.")
-        vehicle_crop = self._vehicle_crop(frame.image, detection)
-        success, encoded = cv2.imencode(".jpg", vehicle_crop)
+            raise VisionError("Đề xuất biển số cần track ID hợp lệ.")
+        success, encoded = cv2.imencode(".jpg", frame.image)
         if not success:
-            raise VisionError("Không thể mã hóa ảnh phương tiện để nhân viên đối chiếu.")
-        sample_data = [data for _, data in self._vehicle_samples.get(detection.track_id, ())]
-        if not sample_data or sample_data[-1] != encoded.tobytes():
-            sample_data.append(encoded.tobytes())
+            raise VisionError("Không thể mã hóa ảnh camera để nhân viên đối chiếu.")
+        image_data = encoded.tobytes()
         return EventCandidate(
             id=uuid.uuid4().hex,
             source_id=frame.source_id,
@@ -281,42 +270,15 @@ class VideoWorker(QThread):
             source_kind=frame.source_kind,
             stream_id=frame.stream_id,
             track_id=detection.track_id,
-            direction=direction,
-            vehicle_type=detection.vehicle_type,
+            direction=(
+                GateDirection.ENTRY
+                if self.config.purpose == SourcePurpose.ENTRY
+                else GateDirection.EXIT
+            ),
+            vehicle_type=VehicleType.MOTORCYCLE,
             confidence=detection.confidence,
             observed_at=frame.observed_at,
             media_time_s=frame.media_time_s,
-            image_data=encoded.tobytes(),
-            vehicle_image_samples=tuple(sample_data[-5:]),
+            image_data=image_data,
+            source_image_samples=(image_data,),
         )
-
-    def _remember_vehicle_samples(
-        self,
-        image,
-        detections: tuple[VehicleDetection, ...],
-        frame_index: int,
-    ) -> None:
-        for track_id in tuple(self._vehicle_samples):
-            samples = self._vehicle_samples[track_id]
-            if samples and frame_index - samples[-1][0] > self.vision_options.stale_track_frames:
-                del self._vehicle_samples[track_id]
-        if frame_index % 5:
-            return
-        for detection in detections:
-            if detection.track_id is None:
-                continue
-            crop = self._vehicle_crop(image, detection)
-            success, encoded = cv2.imencode(".jpg", crop)
-            if success:
-                self._vehicle_samples[detection.track_id].append((frame_index, encoded.tobytes()))
-
-    @staticmethod
-    def _vehicle_crop(image, detection: VehicleDetection):
-        height, width = image.shape[:2]
-        x1 = max(0, min(width, round(detection.x1 * width)))
-        y1 = max(0, min(height, round(detection.y1 * height)))
-        x2 = max(0, min(width, round(detection.x2 * width)))
-        y2 = max(0, min(height, round(detection.y2 * height)))
-        if x2 <= x1 or y2 <= y1:
-            raise VisionError("Không thể cắt ảnh phương tiện từ kết quả phát hiện.")
-        return image[y1:y2, x1:x2]

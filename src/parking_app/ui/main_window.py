@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QFrame,
@@ -38,7 +38,10 @@ from parking_app.ui.customer_view import CustomerManagementWidget
 from parking_app.ui.dashboard_view import ParkingDashboardWidget
 from parking_app.ui.exception_view import ExceptionManagementWidget
 from parking_app.ui.parking_view import ParkingManagementWidget
-from parking_app.ui.plate_recognition_worker import PlateRecognitionWorker
+from parking_app.ui.plate_recognition_worker import (
+    PlateRecognitionWarmupWorker,
+    PlateRecognitionWorker,
+)
 from parking_app.ui.source_view import SourceManagementWidget
 from parking_app.ui.user_admin_view import UserManagementWidget
 
@@ -59,8 +62,9 @@ class MainWindow(QMainWindow):
         parking_service: ParkingService | None = None,
         source_service: SourceService | None = None,
         video_options: VideoOptions | None = None,
-        vision_options: VisionOptions | None = None,
+        plate_vision_options: VisionOptions | None = None,
         plate_recognition_service: PlateRecognitionUseCase | None = None,
+        warmup_plate_recognition: bool = False,
     ) -> None:
         super().__init__(parent)
         self.current_user = current_user
@@ -71,20 +75,24 @@ class MainWindow(QMainWindow):
         self.source_service = source_service
         defaults = AppSettings()
         self.video_options = video_options or defaults.video_options
-        self.vision_options = vision_options or defaults.vision_options
+        self.plate_vision_options = plate_vision_options or defaults.plate_vision_options
         self.source_widget = None
         self._logout_pending = False
         self._close_pending = False
         self._plate_recognition_service = plate_recognition_service or PlateRecognitionService(
-            defaults.plate_recognition_options
+            defaults.plate_recognition_options,
+            plate_vision_options=self.plate_vision_options,
         )
         self._plate_worker: PlateRecognitionWorker | None = None
+        self._ocr_warmup_worker: PlateRecognitionWarmupWorker | None = None
         self._plate_request_queue: deque[tuple[str, tuple[bytes, ...]]] = deque()
 
         self.setWindowTitle("Bãi xe thông minh — Quản lý vận hành")
         self.setMinimumSize(1100, 700)
         self.resize(1280, 820)
         self._init_ui()
+        if warmup_plate_recognition:
+            QTimer.singleShot(0, self._start_ocr_warmup)
 
     def _init_ui(self) -> None:
         central_widget = QWidget(self)
@@ -142,17 +150,18 @@ class MainWindow(QMainWindow):
                 self.source_service,
                 self.current_user,
                 self.video_options,
-                self.vision_options,
                 parent=self,
                 open_session_count_provider=(
                     lambda: self.parking_service.get_capacity_summary().total_active
                 )
                 if self.parking_service is not None
                 else None,
+                plate_vision_options=self.plate_vision_options,
             )
             self.source_widget.stopped.connect(self._source_stopped)
             self.source_widget.simulation_changed.connect(self._set_simulation)
             self.source_widget.review_candidate_requested.connect(self._review_candidate)
+            self.source_widget.playback_started.connect(self._stop_operation_camera)
             self.tabs.addTab(self.source_widget, "Nguồn hình — Camera / MP4")
 
         if self.parking_service is not None:
@@ -160,8 +169,16 @@ class MainWindow(QMainWindow):
                 self.parking_service,
                 self.current_user,
                 parent=self,
+                source_service=self.source_service,
+                video_options=self.video_options,
+                plate_vision_options=self.plate_vision_options,
             )
             self.parking_widget.plate_recognition_requested.connect(self._start_plate_recognition)
+            self.parking_widget.camera_candidate_detected.connect(self._review_candidate)
+            if self.parking_widget.camera_panel is not None:
+                self.parking_widget.camera_panel.simulation_changed.connect(self._set_simulation)
+                self.parking_widget.camera_panel.playback_started.connect(self._stop_source_preview)
+                self.parking_widget.camera_panel.stopped.connect(self._source_stopped)
             self.tabs.addTab(self.parking_widget, "Vận hành bãi xe")
 
             if self.current_user.is_manager:
@@ -224,6 +241,14 @@ class MainWindow(QMainWindow):
         self._logout_pending = True
         self.close()
 
+    def _stop_source_preview(self) -> None:
+        if self.source_widget is not None:
+            self.source_widget.stop_playback()
+
+    def _stop_operation_camera(self) -> None:
+        if self.parking_service is not None and self.parking_widget.camera_panel is not None:
+            self.parking_widget.camera_panel.stop_playback()
+
     def _set_simulation(self, active: bool) -> None:
         if self.parking_service is not None:
             self.parking_service.set_operation_source(SourceKind.MP4 if active else SourceKind.LIVE)
@@ -239,9 +264,40 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.parking_widget)
         self._run_next_plate_request()
 
-    def _start_plate_recognition(
-        self, candidate_id: str, vehicle_images: tuple[bytes, ...]
-    ) -> None:
+    def _start_ocr_warmup(self) -> None:
+        if self._ocr_warmup_worker is not None or self._close_pending:
+            return
+        worker = PlateRecognitionWarmupWorker(self._plate_recognition_service, parent=self)
+        self._ocr_warmup_worker = worker
+        worker.completed.connect(self._ocr_warmup_completed)
+        worker.failed.connect(self._ocr_warmup_failed)
+        worker.finished.connect(self._ocr_warmup_finished)
+        if self.parking_service is not None:
+            self.parking_widget.set_ocr_runtime_status(
+                "Đang khởi tạo PaddleOCR nền; có thể nhập biển thủ công trong lúc chờ."
+            )
+        worker.start()
+
+    def _ocr_warmup_completed(self) -> None:
+        if self.parking_service is not None:
+            self.parking_widget.set_ocr_runtime_status("PaddleOCR đã sẵn sàng.")
+
+    def _ocr_warmup_failed(self, message: str) -> None:
+        if self.parking_service is not None:
+            self.parking_widget.set_ocr_runtime_status(
+                f"PaddleOCR chưa sẵn sàng: {message}. Có thể nhập biển thủ công."
+            )
+
+    def _ocr_warmup_finished(self) -> None:
+        worker = self.sender()
+        if worker is not self._ocr_warmup_worker:
+            return
+        self._ocr_warmup_worker = None
+        worker.deleteLater()
+        if self._close_pending:
+            self.close()
+
+    def _start_plate_recognition(self, candidate_id: str, source_images: tuple[bytes, ...]) -> None:
         if len(self._plate_request_queue) >= 10:
             if hasattr(self, "parking_widget"):
                 self.parking_widget.stage_plate_recognition_error(
@@ -249,7 +305,7 @@ class MainWindow(QMainWindow):
                     "Hàng đợi OCR đang đầy; vui lòng chờ rồi thử lại.",
                 )
             return
-        self._plate_request_queue.append((candidate_id, vehicle_images))
+        self._plate_request_queue.append((candidate_id, source_images))
         if self._plate_worker is not None and self._plate_worker.isRunning():
             if hasattr(self, "parking_widget"):
                 self.parking_widget.stage_plate_recognition_pending(candidate_id)
@@ -304,10 +360,24 @@ class MainWindow(QMainWindow):
             self.close()
 
     def closeEvent(self, event) -> None:
+        if (
+            self.parking_service is not None
+            and self.parking_widget.camera_panel is not None
+            and self.parking_widget.camera_panel.worker is not None
+        ):
+            self._close_pending = True
+            self._plate_request_queue.clear()
+            self.parking_widget.camera_panel.shutdown()
+            event.ignore()
+            return
         if self.source_widget is not None and self.source_widget.worker is not None:
             self._close_pending = True
             self._plate_request_queue.clear()
             self.source_widget.stop_playback()
+            event.ignore()
+            return
+        if self._ocr_warmup_worker is not None and self._ocr_warmup_worker.isRunning():
+            self._close_pending = True
             event.ignore()
             return
         if self._plate_worker is not None and self._plate_worker.isRunning():
@@ -321,6 +391,9 @@ class MainWindow(QMainWindow):
             return
         if self.source_widget is not None:
             self.source_widget.timer.stop()
+        close_ocr = getattr(self._plate_recognition_service, "close", None)
+        if callable(close_ocr):
+            close_ocr()
         event.accept()
         if self._logout_pending:
             self.auth_service.record_logout(self.current_user)

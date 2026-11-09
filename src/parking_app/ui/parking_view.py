@@ -28,11 +28,15 @@ from PySide6.QtWidgets import (
 )
 
 from parking_app.application.parking_service import ParkingService
+from parking_app.application.source_service import SourceService
+from parking_app.config.settings import AppSettings
 from parking_app.domain.enums import ParkingStatus, VehicleType
 from parking_app.domain.exceptions import DomainError
 from parking_app.domain.models import ParkingSession, User, Vehicle
 from parking_app.domain.plate import PlateRecognition, normalize_plate
+from parking_app.domain.video import VideoOptions, VisionOptions
 from parking_app.domain.vision import EventCandidate, GateDirection
+from parking_app.ui.operation_camera import OperationCameraPanel
 
 
 class ParkingManagementWidget(QWidget):
@@ -40,6 +44,7 @@ class ParkingManagementWidget(QWidget):
 
     plate_recognition_requested = Signal(str, object)
     session_state_changed = Signal()
+    camera_candidate_detected = Signal(object)
     SESSION_HEADERS = ("Mã lượt", "Biển số", "Loại xe", "Giờ vào", "Giờ ra", "Trạng thái")
 
     def __init__(
@@ -47,6 +52,10 @@ class ParkingManagementWidget(QWidget):
         parking_service: ParkingService,
         current_user: User,
         parent=None,  # noqa: ANN001
+        *,
+        source_service: SourceService | None = None,
+        video_options: VideoOptions | None = None,
+        plate_vision_options: VisionOptions | None = None,
     ) -> None:
         super().__init__(parent)
         self.parking_service = parking_service
@@ -70,6 +79,18 @@ class ParkingManagementWidget(QWidget):
         self.selected_session_id: int | None = None
         self._entry_registered_vehicle: Vehicle | None = None
         self._init_ui()
+        self.camera_panel: OperationCameraPanel | None = None
+        if source_service is not None:
+            defaults = AppSettings()
+            self.camera_panel = OperationCameraPanel(
+                source_service,
+                current_user,
+                video_options or defaults.video_options,
+                plate_vision_options or defaults.plate_vision_options,
+                parent=self,
+            )
+            self.camera_panel.candidate_detected.connect(self.camera_candidate_detected)
+            self.layout().insertWidget(1, self.camera_panel)
         self.refresh()
 
     def _init_ui(self) -> None:
@@ -82,6 +103,14 @@ class ParkingManagementWidget(QWidget):
         self.tabs.addTab(self._build_exit_tab(), "Xe đang gửi / xác nhận ra")
         self.tabs.addTab(self._build_history_tab(), "Tra cứu lượt")
         layout.addWidget(self.tabs)
+
+    def set_ocr_runtime_status(self, message: str) -> None:
+        if self.camera_panel is not None:
+            self.camera_panel.set_ocr_runtime_status(message)
+
+    def shutdown_camera(self) -> None:
+        if self.camera_panel is not None:
+            self.camera_panel.shutdown()
 
     def _build_entry_tab(self) -> QWidget:
         page = QWidget()
@@ -370,7 +399,7 @@ class ParkingManagementWidget(QWidget):
                 "Ảnh xe đề xuất — cần nhân viên kiểm tra",
             )
             self.entry_note_input.setText(
-                f"Đề xuất qua vạch từ {candidate.source_name}, track #{candidate.track_id}; "
+                f"Đề xuất từ camera {candidate.source_name}, track #{candidate.track_id}; "
                 "OCR chỉ đề xuất, cần nhân viên kiểm tra."
             )
             self.entry_plate_input.setFocus()
@@ -378,7 +407,7 @@ class ParkingManagementWidget(QWidget):
             self._active_plate_mode = "entry"
             self.plate_recognition_requested.emit(
                 candidate.id,
-                candidate.vehicle_image_samples or (candidate.image_data,),
+                candidate.source_image_samples or (candidate.image_data,),
             )
             return
 
@@ -405,7 +434,7 @@ class ParkingManagementWidget(QWidget):
         self._populate_active_table(self.parking_service.list_active_sessions())
         self.plate_recognition_requested.emit(
             candidate.id,
-            candidate.vehicle_image_samples or (candidate.image_data,),
+            candidate.source_image_samples or (candidate.image_data,),
         )
 
     def stage_plate_recognition(
@@ -731,7 +760,8 @@ class ParkingManagementWidget(QWidget):
             self.refresh()
             return
         answer = QMessageBox.question(
-            self, "Xóa lượt đang gửi",
+            self,
+            "Xóa lượt đang gửi",
             f"Xóa lượt {target.session_code} của xe {target.snapshot_display_plate}? "
             "Thao tác này không thể hoàn tác.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

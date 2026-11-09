@@ -15,42 +15,36 @@ from parking_app.infrastructure.persistence.repositories import SqlAlchemyUserRe
 from parking_app.infrastructure.security import hash_password
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_PLATE_MODEL_PATH = Path(
+    r"D:\LHU\5 HKV\Thi Giac May Tinh - Nguyen Minh Phuc\AI training"
+    r"\runs\detect\train\weights\best.pt"
+)
 
 
-def _vision_options() -> VisionOptions:
-    model_path = Path(
-        os.getenv("PARKING_VISION_MODEL", str(PROJECT_ROOT / "models" / "yolov8n.pt"))
-    ).expanduser()
+def _plate_vision_options() -> VisionOptions:
+    model_path = Path(os.getenv("PARKING_PLATE_MODEL", str(DEFAULT_PLATE_MODEL_PATH))).expanduser()
     if not model_path.is_absolute():
         model_path = PROJECT_ROOT / model_path
     return VisionOptions(
         model_path=model_path,
-        confidence_threshold=float(os.getenv("PARKING_VISION_CONFIDENCE", "0.25")),
-        image_size=int(os.getenv("PARKING_VISION_IMAGE_SIZE", "640")),
-        device=os.getenv("PARKING_VISION_DEVICE", "cpu"),
-        crossing_deadband=float(os.getenv("PARKING_CROSSING_DEADBAND", "0.015")),
-        crossing_stable_frames=int(os.getenv("PARKING_CROSSING_STABLE_FRAMES", "2")),
-        stale_track_frames=int(os.getenv("PARKING_TRACK_STALE_FRAMES", "300")),
+        confidence_threshold=float(os.getenv("PARKING_PLATE_CONFIDENCE", "0.25")),
+        image_size=int(os.getenv("PARKING_PLATE_IMAGE_SIZE", "640")),
+        device=os.getenv("PARKING_PLATE_DEVICE", "cpu"),
     )
 
 
 def _plate_recognition_options() -> PlateRecognitionOptions:
-    backend = os.getenv("PARKING_OCR_BACKEND", "fast_plate")
-    if backend not in {"fast_plate", "paddle"}:
-        raise ValueError("PARKING_OCR_BACKEND phải là fast_plate hoặc paddle.")
-    runtime = ".venv-alpr" if backend == "fast_plate" else ".venv-ocr-313"
-    worker = "plate_ocr_worker.py" if backend == "fast_plate" else "ocr_worker.py"
-    detector_path = Path(
-        os.getenv("PARKING_PLATE_MODEL", str(PROJECT_ROOT / "models" / "license_plate_yolo11s.pt"))
-    ).expanduser()
+    backend = os.getenv("PARKING_OCR_BACKEND", "paddle")
+    if backend != "paddle":
+        raise ValueError("PARKING_OCR_BACKEND hiện chỉ hỗ trợ paddle.")
     python_path = Path(
         os.getenv(
             "PARKING_OCR_PYTHON",
-            str(PROJECT_ROOT / runtime / "Scripts" / "python.exe"),
+            str(PROJECT_ROOT / ".venv-ocr-313" / "Scripts" / "python.exe"),
         )
     ).expanduser()
     worker_path = Path(
-        os.getenv("PARKING_OCR_WORKER", str(PROJECT_ROOT / "scripts" / worker))
+        os.getenv("PARKING_OCR_WORKER", str(PROJECT_ROOT / "scripts" / "ocr_worker.py"))
     ).expanduser()
     cache_dir = Path(
         os.getenv("PARKING_OCR_CACHE", str(PROJECT_ROOT / ".runtime" / "paddlex"))
@@ -61,26 +55,8 @@ def _plate_recognition_options() -> PlateRecognitionOptions:
         cache_dir=cache_dir if cache_dir.is_absolute() else PROJECT_ROOT / cache_dir,
         timeout_s=float(os.getenv("PARKING_OCR_TIMEOUT_S", "30")),
         max_samples=int(os.getenv("PARKING_OCR_MAX_SAMPLES", "5")),
-        detector_model_path=(
-            detector_path if detector_path.is_absolute() else PROJECT_ROOT / detector_path
-        ),
-        detector_confidence=float(os.getenv("PARKING_PLATE_CONFIDENCE", "0.15")),
-        detector_image_size=int(os.getenv("PARKING_PLATE_IMAGE_SIZE", "960")),
-        detector_device=os.getenv("PARKING_PLATE_DEVICE", "cpu"),
-        max_regions=int(os.getenv("PARKING_PLATE_MAX_REGIONS", "2")),
         min_ocr_confidence=float(os.getenv("PARKING_OCR_MIN_CONFIDENCE", "0.6")),
-        ocr_model_path=_project_path(
-            "PARKING_PLATE_OCR_MODEL", "models/plate_ocr/cct_s_v2_global.onnx"
-        ),
-        ocr_config_path=_project_path(
-            "PARKING_PLATE_OCR_CONFIG", "models/plate_ocr/cct_s_v2_global_plate_config.yaml"
-        ),
     )
-
-
-def _project_path(variable: str, default: str) -> Path:
-    path = Path(os.getenv(variable, default)).expanduser()
-    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 @dataclass
@@ -92,7 +68,7 @@ class AppSettings:
     data_dir: Path = PROJECT_ROOT / "data"
     db_path: Path = PROJECT_ROOT / "data" / "parking.db"
     evidence_dir: Path = PROJECT_ROOT / "data" / "evidence"
-    vision_options: VisionOptions = field(default_factory=_vision_options)
+    plate_vision_options: VisionOptions = field(default_factory=_plate_vision_options)
     plate_recognition_options: PlateRecognitionOptions = field(
         default_factory=_plate_recognition_options
     )

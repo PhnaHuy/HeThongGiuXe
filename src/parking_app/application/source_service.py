@@ -8,7 +8,6 @@ from parking_app.domain.enums import AuditAction, UserRole, UserStatus
 from parking_app.domain.exceptions import PermissionDeniedError, ValidationError
 from parking_app.domain.models import AuditEntry, User
 from parking_app.domain.video import (
-    GateLine,
     ParkingSpace,
     SourceConfig,
     SourceKind,
@@ -43,7 +42,6 @@ class SourceService:
             SourceKind(row.kind),
             row.endpoint,
             SourcePurpose(row.purpose),
-            GateLine(**row.gate_line) if row.gate_line else None,
             tuple(
                 ParkingSpace(
                     code=space["code"],
@@ -74,7 +72,7 @@ class SourceService:
             row.kind = config.kind.value
             row.endpoint = config.endpoint.strip()
             row.purpose = config.purpose.value
-            row.gate_line = asdict(config.line) if config.line else None
+            row.gate_line = None
             row.parking_spaces = [asdict(space) for space in config.parking_spaces]
             SqlAlchemyAuditRepository(session).add(
                 AuditEntry(
@@ -117,6 +115,5 @@ class SourceService:
             "name": config.name,
             "kind": config.kind.value,
             "purpose": config.purpose.value,
-            "line": asdict(config.line) if config.line else None,
             "parking_spaces": [asdict(space) for space in config.parking_spaces],
         }

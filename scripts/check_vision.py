@@ -9,13 +9,15 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
 DETECTION_MODEL = "PP-OCRv5_mobile_det"
 RECOGNITION_MODEL = "PP-OCRv5_mobile_rec"
 SYNTHETIC_TEXT = "DEMO 12345"
@@ -124,69 +126,25 @@ def check_video(work_dir: Path) -> dict[str, Any]:
     }
 
 
-def check_yolo(model_path: Path) -> dict[str, Any]:
-    """Run the configured local YOLO model on CPU without auto-downloading it."""
-    if not model_path.is_file():
-        raise CheckBlocked(f"Chưa có trọng số model tại {model_path}.")
-    from ultralytics import YOLO
+def check_plate_detector(model_path: Path) -> dict[str, Any]:
+    """Load the configured plate checkpoint and run one synthetic inference."""
+    from parking_app.config.settings import AppSettings
+    from parking_app.infrastructure.vision.plate_detector import YOLOPlateDetector
 
-    model = YOLO(str(model_path))
-    frame = synthetic_frame()
-    results = model.predict(frame, device="cpu", imgsz=320, verbose=False)
-    if len(results) != 1:
-        raise RuntimeError("YOLO không trả đúng một kết quả cho một khung hình.")
-    counts = []
-    for offset in (0, 4):
-        tracked = model.track(
-            synthetic_frame(offset),
-            device="cpu",
-            imgsz=320,
-            tracker="bytetrack.yaml",
-            persist=True,
-            verbose=False,
-        )
-        if len(tracked) != 1:
-            raise RuntimeError("Tracking không trả đúng một kết quả cho một khung hình.")
-        counts.append(len(tracked[0].boxes))
+    if not model_path.is_file():
+        raise CheckBlocked(f"Chưa có trọng số model biển số tại {model_path}.")
+    options = replace(AppSettings().plate_vision_options, model_path=model_path)
+    detector = YOLOPlateDetector(options)
+    detections = detector.detect(synthetic_frame())
     return {
         "model": str(model_path),
         "model_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
-        "device": "cpu",
-        "predict_result_count": len(results),
-        "track_frame_detection_counts": counts,
-        "synthetic": True,
-        "limitation": "Frame tổng hợp có thể không có xe; không đánh giá độ chính xác phát hiện.",
-    }
-
-
-def check_bytetrack() -> dict[str, Any]:
-    """Verify ID association with two synthetic boxes independently of YOLO."""
-    import numpy as np
-    import ultralytics
-    from ultralytics.engine.results import Boxes
-    from ultralytics.trackers.byte_tracker import BYTETracker
-    from ultralytics.utils import YAML
-
-    config = Path(ultralytics.__file__).parent / "cfg" / "trackers" / "bytetrack.yaml"
-    tracker_args = SimpleNamespace(**YAML.load(str(config)))
-    tracker = BYTETracker(tracker_args)
-    ids = []
-    for offset in (0, 4):
-        boxes = Boxes(
-            np.array([[60 + offset, 140, 260 + offset, 260, 0.95, 2]], dtype=np.float32),
-            orig_shape=(360, 640),
-        )
-        tracks = tracker.update(boxes, img=synthetic_frame(offset))
-        if len(tracks) != 1:
-            raise RuntimeError(f"ByteTrack trả {len(tracks)} track thay vì một track.")
-        ids.append(int(tracks[0, 4]))
-    if ids[0] != ids[1]:
-        raise RuntimeError(f"ByteTrack không giữ ID qua hai khung: {ids}.")
-    return {
-        "config": str(config),
-        "track_ids": ids,
-        "synthetic": True,
-        "limitation": "Chỉ kiểm tra liên kết hai detection tổng hợp; chưa kiểm tra xe thực tế.",
+        "classes": {
+            class_id: detector.model.names[class_id] for class_id in detector.plate_class_ids
+        },
+        "synthetic_plate_detection_count": len(detections),
+        "device": options.device,
+        "limitation": "Synthetic scene only; zero detections does not measure real plate recall.",
     }
 
 
@@ -288,21 +246,23 @@ def main() -> int:
     parser.add_argument("--component", choices=("vision", "ocr", "all"), default="all")
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "reports" / "g0-vision.json")
     parser.add_argument("--work-dir", type=Path)
-    parser.add_argument(
-        "--vehicle-model", type=Path, default=PROJECT_ROOT / "models" / "yolov8n.pt"
-    )
+    parser.add_argument("--plate-model", type=Path)
     parser.add_argument("--ocr-model-root", type=Path)
     parser.add_argument("--allow-model-download", action="store_true")
     args = parser.parse_args()
+    from parking_app.config.settings import AppSettings
+
+    settings = AppSettings()
+    plate_model = (args.plate_model or settings.plate_vision_options.model_path).resolve()
     default_ocr_root = configure_local_caches()
     work_dir = (args.work_dir or PROJECT_ROOT / ".runtime" / "g0-media" / args.component).resolve()
     checks = [run_check("opencv_mp4", lambda: check_video(work_dir))]
     if args.component in ("vision", "all"):
-        checks.append(run_check("yolo_cpu", lambda: check_yolo(args.vehicle_model.resolve())))
-        checks.append(run_check("bytetrack", check_bytetrack))
+        checks.append(run_check("plate_detector_cpu", lambda: check_plate_detector(plate_model)))
     else:
-        checks.append({"name": "yolo_cpu", "status": "skipped", "reason": "OCR interpreter"})
-        checks.append({"name": "bytetrack", "status": "skipped", "reason": "OCR interpreter"})
+        checks.append(
+            {"name": "plate_detector_cpu", "status": "skipped", "reason": "OCR interpreter"}
+        )
     if args.component in ("ocr", "all"):
         ocr_root = (args.ocr_model_root or default_ocr_root).resolve()
         checks.append(

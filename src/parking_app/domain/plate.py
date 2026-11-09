@@ -10,7 +10,7 @@ from pathlib import Path
 from parking_app.domain.exceptions import ValidationError
 
 # Characters that are formatting separators in Vietnamese license plates
-_SEPARATOR_PATTERN = re.compile(r"[\s\.\-_/\\:]+")
+_SEPARATOR_PATTERN = re.compile(r"[\s\.\-_/\\:·]+")
 _ALPHANUMERIC_PATTERN = re.compile(r"^[A-Z0-9]+$")
 
 
@@ -19,6 +19,13 @@ class PlateOCRObservation:
     raw_text: str
     confidence: float
     normalized_plate: str | None
+
+
+@dataclass(frozen=True)
+class PlateOCRResult:
+    text: str
+    confidence: float
+    plate_image_data: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -42,29 +49,15 @@ class PlateRecognitionOptions:
     cache_dir: Path
     timeout_s: float = 30.0
     max_samples: int = 5
-    detector_model_path: Path | None = None
-    detector_confidence: float = 0.15
-    detector_image_size: int = 960
-    detector_device: str = "cpu"
-    max_regions: int = 2
     min_ocr_confidence: float = 0.6
-    ocr_model_path: Path | None = None
-    ocr_config_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not isfinite(self.timeout_s) or self.timeout_s <= 0:
             raise ValidationError("Thời gian chờ OCR phải là số dương.")
         if not 1 <= self.max_samples <= 10:
             raise ValidationError("Số ảnh OCR phải nằm trong khoảng 1–10.")
-        if not 1 <= self.max_regions <= 2:
-            raise ValidationError("Số vùng biển trên mỗi ảnh phải nằm trong khoảng 1–2.")
-        if not all(
-            isfinite(value) and 0 < value <= 1
-            for value in (self.detector_confidence, self.min_ocr_confidence)
-        ):
+        if not isfinite(self.min_ocr_confidence) or not 0 < self.min_ocr_confidence <= 1:
             raise ValidationError("Ngưỡng nhận diện biển số phải nằm trong khoảng (0, 1].")
-        if not 32 <= self.detector_image_size <= 2048 or not self.detector_device.strip():
-            raise ValidationError("Kích thước hoặc thiết bị detector biển số không hợp lệ.")
 
 
 def normalize_plate(raw_plate: str | None) -> str:

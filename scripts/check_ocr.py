@@ -46,29 +46,27 @@ def main() -> int:
         image = _synthetic_vehicle()
 
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
-    from parking_app.application.plate_recognition import PlateRecognitionService
     from parking_app.config.settings import AppSettings
+    from parking_app.infrastructure.vision.paddle_ocr import PaddleOCRSubprocess
 
     success, encoded = cv2.imencode(".jpg", image)
     if not success:
         raise RuntimeError("Không mã hóa được ảnh thử OCR.")
-    recognition = PlateRecognitionService(AppSettings().plate_recognition_options).recognize(
+    result = PaddleOCRSubprocess(AppSettings().plate_recognition_options).recognize(
         (encoded.tobytes(),)
-    )
+    )[0]
     print(
         json.dumps(
             {
-                "raw_text": recognition.raw_text,
-                "proposed_plate": recognition.proposed_plate,
-                "confidence": recognition.confidence,
-                "samples_considered": recognition.samples_considered,
-                "plate_region_detected": recognition.plate_image_data is not None,
+                "raw_text": result.text,
+                "confidence": result.confidence,
+                "plate_text_crop_created": result.plate_image_data is not None,
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    return 0 if recognition.proposed_plate else 2
+    return 0 if result.text else 2
 
 
 if __name__ == "__main__":

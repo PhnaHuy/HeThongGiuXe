@@ -1,11 +1,10 @@
-"""G3 source preview, playback, camera configuration and gate-line editor."""
+"""G3 source preview, playback, and fixed-purpose camera configuration."""
 
 from __future__ import annotations
 
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -30,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from parking_app.application.source_service import SourceService
+from parking_app.config.settings import DEFAULT_PLATE_MODEL_PATH
 from parking_app.domain.exceptions import DomainError
 from parking_app.domain.models import User
 from parking_app.domain.video import (
@@ -43,10 +43,7 @@ from parking_app.domain.video import (
     VisionOptions,
 )
 from parking_app.domain.vision import EventCandidate
-from parking_app.infrastructure.vision.yolo_detector import (
-    VehicleDetector,
-    YOLOVehicleDetector,
-)
+from parking_app.infrastructure.vision.plate_detector import PlateTracker, YOLOPlateDetector
 from parking_app.ui.video_canvas import VideoCanvas, bgr_to_qimage
 from parking_app.ui.video_worker import VideoWorker
 
@@ -55,25 +52,26 @@ class SourceManagementWidget(QWidget):
     stopped = Signal()
     simulation_changed = Signal(bool)
     review_candidate_requested = Signal(object)
+    playback_started = Signal()
 
     def __init__(
         self,
         service: SourceService,
         actor: User,
         options: VideoOptions | None = None,
-        vision_options: VisionOptions | None = None,
-        detector_factory: Callable[[VisionOptions], VehicleDetector] = YOLOVehicleDetector,
         parent=None,
         open_session_count_provider: Callable[[], int] | None = None,
+        plate_vision_options: VisionOptions | None = None,
+        plate_detector_factory: Callable[[VisionOptions], PlateTracker] = YOLOPlateDetector,
     ) -> None:
         super().__init__(parent)
         self.service = service
         self.actor = actor
         self.options = options or VideoOptions()
-        self.vision_options = vision_options or VisionOptions(
-            model_path=Path(__file__).resolve().parents[3] / "models" / "yolov8n.pt"
+        self.plate_vision_options = plate_vision_options or VisionOptions(
+            model_path=DEFAULT_PLATE_MODEL_PATH
         )
-        self.detector_factory: Callable[[VisionOptions], VehicleDetector] = detector_factory
+        self.plate_detector_factory = plate_detector_factory
         self.open_session_count_provider = open_session_count_provider
         self._open_session_count: int | None = None
         self._last_open_count_refresh = 0.0
@@ -99,7 +97,8 @@ class SourceManagementWidget(QWidget):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         self.mode_label = QLabel(
-           # "G4–G5: YOLOv8n/ByteTrack và OCR chỉ đề xuất; nhân viên đối chiếu thủ công."
+            "Model best.pt phát hiện và theo dõi biển số. PaddleOCR chỉ đọc crop biển số; "
+            "nhân viên xác nhận."
         )
         self.mode_label.setWordWrap(True)
         layout.addWidget(self.mode_label)
@@ -127,7 +126,6 @@ class SourceManagementWidget(QWidget):
         content = QSplitter(Qt.Orientation.Horizontal)
         content.setChildrenCollapsible(False)
         self.canvas = VideoCanvas()
-        self.canvas.editable = self.actor.is_admin
         self.editor = QGroupBox("Cấu hình nguồn — quản trị viên")
         self.editor.setMinimumWidth(340)
         editor_layout = QVBoxLayout(self.editor)
@@ -161,21 +159,14 @@ class SourceManagementWidget(QWidget):
         form.addRow("Loại nguồn", self.kind_combo)
         form.addRow("Nguồn (được che)", self.endpoint_input)
         form.addRow("Mục đích", self.purpose_combo)
-        self.reverse_check = QCheckBox("Đảo chiều VÀO của vạch")
-        self.reverse_check.toggled.connect(self._reverse_line)
-        self.canvas.line_changed.connect(self._line_drawn)
         self.canvas.polygon_changed.connect(self._polygon_finished)
-        form.addRow(self.reverse_check)
         hint = QLabel(
-            "Kéo chuột trên hình từ A đến B để vẽ/sửa vạch.\n"
-            "Mũi tên VÀO chỉ chiều vào; chiều ngược lại là RA.\n"
+            "Mỗi camera cổng cố định một mục đích VÀO hoặc RA; "
+            "hướng đề xuất lấy từ mục đích đã lưu.\n"
             "Với nguồn KHU ĐỖ: nhập mã ô, bắt đầu vẽ, bấm các đỉnh polygon rồi lưu polygon."
         )
         hint.setWordWrap(True)
         form.addRow(hint)
-        clear = QPushButton("Xóa vạch đang sửa")
-        clear.clicked.connect(self._clear_line)
-        form.addRow(clear)
         self.space_code_input = QLineEdit()
         self.space_code_input.setPlaceholderText("Ví dụ: A01")
         form.addRow("Mã ô đỗ", self.space_code_input)
@@ -203,7 +194,7 @@ class SourceManagementWidget(QWidget):
         editor_layout.addWidget(self.editor_scroll_area, 1)
 
         action_row = QHBoxLayout()
-        self.save_button = QPushButton("Lưu cấu hình và vạch")
+        self.save_button = QPushButton("Lưu cấu hình nguồn")
         self.save_button.setObjectName("primaryButton")
         self.save_button.clicked.connect(self._save_source)
         action_row.addWidget(self.save_button, 2)
@@ -247,7 +238,9 @@ class SourceManagementWidget(QWidget):
         self.parking_summary_label.setWordWrap(True)
         layout.addWidget(self.parking_summary_label)
         layout.addWidget(self.status_label)
-        layout.addWidget(QLabel("Sự kiện qua vạch — đề xuất, cần nhân viên xác nhận:"))
+        layout.addWidget(
+            QLabel("Xe phát hiện — hướng theo mục đích camera, cần nhân viên xác nhận:")
+        )
         candidate_row = QHBoxLayout()
         self.candidate_list = QListWidget()
         self.candidate_list.setMaximumHeight(72)
@@ -285,7 +278,7 @@ class SourceManagementWidget(QWidget):
             if self.actor.is_admin:
                 self.source_feedback_label.setText(
                     "Đang tạo nguồn mới. Nhập thông tin bên phải, xem thử nếu cần, "
-                    "rồi nhấn “Lưu cấu hình và vạch”."
+                    "rồi nhấn “Lưu cấu hình nguồn”."
                 )
             else:
                 self.source_feedback_label.setText("Chọn một nguồn đã lưu để xem hình.")
@@ -301,7 +294,8 @@ class SourceManagementWidget(QWidget):
         self.sources.blockSignals(False)
         self._load_config(None)
         self.source_feedback_label.setText(
-            "Tạo nguồn mới: nhập tên, loại và địa chỉ nguồn; sau đó nhấn “Lưu cấu hình và vạch”."
+            "Tạo nguồn mới: nhập tên, loại, địa chỉ và mục đích nguồn; "
+            "sau đó nhấn “Lưu cấu hình nguồn”."
         )
         self.name_input.setFocus()
 
@@ -321,16 +315,10 @@ class SourceManagementWidget(QWidget):
         self.purpose_combo.setCurrentIndex(
             self.purpose_combo.findData(config.purpose) if config else 0
         )
-        self.canvas.line = config.line if config else None
         self._parking_spaces = list(config.parking_spaces) if config else []
         self.canvas.set_parking_spaces(tuple(self._parking_spaces))
         self._refresh_space_selector()
         self._render_parking_summary()
-        self.reverse_check.blockSignals(True)
-        self.reverse_check.setChecked(
-            bool(config and config.line and not config.line.entry_positive)
-        )
-        self.reverse_check.blockSignals(False)
         self.canvas.update()
         self._update_controls()
 
@@ -345,7 +333,6 @@ class SourceManagementWidget(QWidget):
             kind=SourceKind(self.kind_combo.currentData()),
             endpoint=self.endpoint_input.text().strip(),
             purpose=SourcePurpose(self.purpose_combo.currentData()),
-            line=self.canvas.line,
             parking_spaces=tuple(self._parking_spaces),
         )
         config.validate()
@@ -390,7 +377,6 @@ class SourceManagementWidget(QWidget):
         self._last_frame_at = 0
         self._status = StreamStatus.CONNECTING
         self.seek_slider.setRange(0, 0)
-        self.canvas.line = config.line
         self._parking_spaces = list(config.parking_spaces)
         self.canvas.set_parking_spaces(tuple(self._parking_spaces))
         self._refresh_space_selector()
@@ -398,12 +384,16 @@ class SourceManagementWidget(QWidget):
         self._clear_image("Đang kết nối…")
         is_file = config.kind == SourceKind.MP4
         self.mode_label.setText(
-            "MP4 — THỬ NGHIỆM: chọn đề xuất để kiểm tra và xác nhận xe vào/ra."
+            "MP4 — THỬ NGHIỆM: chọn biển số phát hiện để kiểm tra và xác nhận."
             if is_file
             else (
-                "KHU ĐỖ — trạng thái ô được ước lượng từ khung xe và cần kiểm chứng góc camera."
+                "KHU ĐỖ — trạng thái ô được ước lượng từ vùng biển số nhìn thấy."
                 if config.purpose == SourcePurpose.PARKING
-                else "CAMERA TRỰC TIẾP — sự kiện qua vạch chuyển sang OCR và nhân viên xác nhận."
+                else (
+                    "CỔNG VÀO — biển số mới chuyển sang OCR để nhân viên xác nhận."
+                    if config.purpose == SourcePurpose.ENTRY
+                    else "CỔNG RA — biển số mới chuyển sang OCR để nhân viên xác nhận."
+                )
             )
         )
         self.simulation_changed.emit(is_file)
@@ -413,8 +403,8 @@ class SourceManagementWidget(QWidget):
             self.options,
             realtime=realtime,
             initial_index=initial_index,
-            vision_options=self.vision_options,
-            detector_factory=self.detector_factory,
+            plate_vision_options=self.plate_vision_options,
+            plate_detector_factory=self.plate_detector_factory,
         )
         self.worker = worker
         worker.frame_available.connect(self._receive_frame)
@@ -424,6 +414,7 @@ class SourceManagementWidget(QWidget):
         worker.event_candidate.connect(self._receive_candidate)
         worker.finished.connect(self._finished)
         self._update_controls()
+        self.playback_started.emit()
         worker.start()
 
     def stop_playback(self) -> None:
@@ -463,18 +454,18 @@ class SourceManagementWidget(QWidget):
             return
         self.canvas.set_image(
             bgr_to_qimage(frame.image),
-            frame.detections,
             frame.parking_space_states,
+            frame.plate_detections,
         )
         self._render_parking_summary(frame.parking_space_states)
         self._last_frame_at = time.monotonic()
         media = f" | {frame.media_time_s:.2f} giây video" if frame.media_time_s is not None else ""
         dropped = self.worker.dropped_frames
-        tracked = sum(item.track_id is not None for item in frame.detections)
-        line_status = "Có vạch" if self.canvas.line else "Chưa có vạch — hãy vẽ vạch để đếm xe"
+        tracked = sum(item.track_id is not None for item in frame.plate_detections)
         self.position_label.setText(
-            f"Khung {frame.frame_index}{media} | Xe: {len(frame.detections)}"
-            f" | Có ID: {tracked} | {line_status} | Bỏ khung hiển thị: {dropped}"
+            f"Khung {frame.frame_index}{media}"
+            f" | Biển số: {len(frame.plate_detections)} | Có ID: {tracked}"
+            f" | Bỏ khung hiển thị: {dropped}"
         )
         if not self.seek_slider.isSliderDown():
             self.seek_slider.setValue(frame.frame_index)
@@ -511,8 +502,7 @@ class SourceManagementWidget(QWidget):
             f" | video {candidate.media_time_s:.2f}s" if candidate.media_time_s is not None else ""
         )
         item = QListWidgetItem(
-            f"{direction} — {candidate.vehicle_type.display_name} "
-            f"{candidate.confidence:.0%} — track #{candidate.track_id}{media}"
+            f"{direction} — Biển số {candidate.confidence:.0%} — track #{candidate.track_id}{media}"
         )
         item.setData(Qt.ItemDataRole.UserRole, candidate)
         self.candidate_list.addItem(item)
@@ -525,8 +515,7 @@ class SourceManagementWidget(QWidget):
         item = self.candidate_list.currentItem() if hasattr(self, "candidate_list") else None
         candidate = item.data(Qt.ItemDataRole.UserRole) if item else None
         self.review_candidate_button.setEnabled(
-            isinstance(candidate, EventCandidate)
-            and not self._stopping
+            isinstance(candidate, EventCandidate) and not self._stopping
         )
         if isinstance(candidate, EventCandidate) and candidate.source_kind == SourceKind.MP4:
             self.review_candidate_button.setToolTip(
@@ -588,26 +577,6 @@ class SourceManagementWidget(QWidget):
         self.realtime_check.setEnabled(self.worker is None)
         if not running:
             self.pause_button.setText("Tạm dừng")
-
-    def _reverse_line(self, checked: bool) -> None:
-        if self.canvas.line is not None:
-            self.canvas.line = replace(self.canvas.line, entry_positive=not checked)
-            self.canvas.update()
-            self._sync_gate_line()
-
-    def _sync_gate_line(self) -> None:
-        if self.worker is not None and not self._stopping:
-            self.worker.set_gate_line(self.canvas.line)
-            if self._active is not None:
-                self._active = replace(self._active, line=self.canvas.line)
-
-    def _line_drawn(self, _line) -> None:
-        self._reverse_line(self.reverse_check.isChecked())
-
-    def _clear_line(self) -> None:
-        self.canvas.line = None
-        self.canvas.update()
-        self._sync_gate_line()
 
     def _refresh_space_selector(self) -> None:
         self.space_selector.blockSignals(True)
@@ -768,7 +737,7 @@ class SourceManagementWidget(QWidget):
             QMessageBox.question(
                 self,
                 "Xóa nguồn",
-                "Xóa nguồn và vạch đã lưu?",
+                "Xóa nguồn hình đã lưu?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

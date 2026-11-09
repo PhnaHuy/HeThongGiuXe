@@ -1,4 +1,4 @@
-"""Stable per-polygon occupancy estimates derived from fresh vehicle detections."""
+"""Stable per-polygon occupancy estimates derived from detected plate regions."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from parking_app.domain.video import ParkingSpace, ParkingSpaceStatus
-from parking_app.domain.vision import VehicleDetection
+from parking_app.domain.vision import PlateDetection
 
 
 class ParkingSpaceMonitor:
@@ -45,7 +45,7 @@ class ParkingSpaceMonitor:
     def update(
         self,
         image_shape: tuple[int, ...] | None,
-        detections: tuple[VehicleDetection, ...] | None,
+        detections: tuple[PlateDetection, ...] | None,
     ) -> dict[str, ParkingSpaceStatus]:
         if image_shape is None or detections is None or len(image_shape) < 2:
             return self.reset()
@@ -83,7 +83,7 @@ class ParkingSpaceMonitor:
         return self.states
 
     @staticmethod
-    def _valid_detection(detection: VehicleDetection) -> bool:
+    def _valid_detection(detection: PlateDetection) -> bool:
         return (
             all(
                 np.isfinite(value)
@@ -98,7 +98,7 @@ class ParkingSpaceMonitor:
         contour: np.ndarray,
         width: int,
         height: int,
-        detection: VehicleDetection,
+        detection: PlateDetection,
     ) -> float:
         x1 = max(0, min(width, int(detection.x1 * width)))
         y1 = max(0, min(height, int(detection.y1 * height)))

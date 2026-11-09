@@ -76,7 +76,8 @@ class ParkingApplication:
             parking_service=self.parking_service,
             source_service=self.source_service,
             video_options=self.settings.video_options,
-            vision_options=self.settings.vision_options,
+            plate_vision_options=self.settings.plate_vision_options,
+            warmup_plate_recognition=True,
         )
         self.main_window.logout_requested.connect(
             self._show_login, Qt.ConnectionType.QueuedConnection
